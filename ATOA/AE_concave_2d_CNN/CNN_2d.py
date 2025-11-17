@@ -1,176 +1,72 @@
-import argparse
-import os
 import torch
-import torchvision
-from torch import nn
-from torch.autograd import Variable
+import torch.nn as nn
+import torch.nn.functional as F
 
+# ---------------- Residual Block ----------------
+class ResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.InstanceNorm2d(out_ch),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.InstanceNorm2d(out_ch)
+        )
+        self.shortcut = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        return self.act(self.conv(x) + self.shortcut(x))
+
+# ---------------- Encoder ----------------
 class Encoder_CNN_2D(nn.Module):
-    def __init__(self,mask_size=160,dropout_p=0):
-        super(Encoder_CNN_2D, self).__init__()
-        self.conv_layers = nn.Sequential(
-            nn.Conv2d(1, 4, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(4), 
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Dropout(dropout_p), 
+    def __init__(self, mask_size=160, latent_dim=128):
+        super().__init__()
+        self.enc1 = nn.Sequential(ResBlock(1,32), nn.MaxPool2d(2))
+        self.enc2 = nn.Sequential(ResBlock(32,64), nn.MaxPool2d(2))
+        self.enc3 = nn.Sequential(ResBlock(64,128), nn.MaxPool2d(2))
+        self.enc4 = nn.Sequential(ResBlock(128,256), nn.MaxPool2d(2))
 
-            nn.Conv2d(4, 8, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(8),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Dropout(dropout_p),
-
-            nn.Conv2d(8, 16, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(16), 
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Dropout(dropout_p),
-
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(32), 
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Dropout(dropout_p),
-
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64), 
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Dropout(dropout_p),
+        conv_out_size = (mask_size // 16) ** 2 * 256
+        self.fc = nn.Sequential(
+            nn.Linear(conv_out_size, 512),
+            nn.SiLU(),
+            nn.Linear(512, latent_dim)
         )
-
-        self.fc_layers = nn.Sequential(
-			nn.Linear(64 * 5 * 5, 512),
-            # nn.Linear(512 * 9 * 9, 1024),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(dropout_p),
-            nn.Linear(512, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(dropout_p),
-            nn.Linear(128, 28)
-			# nn.Linear(1024, 28)
-        )
-        print("cnn_hyper_parameters:")
-        print("mask_size")
-        print(mask_size)
-        print("dropout_p")
-        print(dropout_p)
-        # assert 0
 
     def forward(self, x):
-    
-        x = self.conv_layers(x)
-        x = x.view(x.size(0), -1)
-        x = self.fc_layers(x)
-        return x
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        e4 = self.enc4(e3)
+        latent = self.fc(e4.flatten(1))
+        return latent, [e1,e2,e3,e4]
 
-
-
+# ---------------- Decoder ----------------
 class Decoder_CNN_2D(nn.Module):
-    def __init__(self, dropout_p=0):
-        super(Decoder_CNN_2D, self).__init__()
-        self.fc_layers = nn.Sequential(
-            #Reverse fully connected layer
-            nn.Linear(28, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(dropout_p),
-            
-            nn.Linear(128, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(dropout_p),
-            
-            nn.Linear(512, 64 * 5 * 5),
-            nn.BatchNorm1d(64 * 5 * 5),
-            nn.ReLU(),
-            nn.Dropout(dropout_p),
+    def __init__(self, latent_dim=128, feature_map_size=10):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(latent_dim, 256*feature_map_size*feature_map_size),
+            nn.SiLU()
         )
+        self.up1 = ResBlock(256+128,128)
+        self.up2 = ResBlock(128+64,64)
+        self.up3 = ResBlock(64+32,32)
+        self.up4 = ResBlock(32,16)
+        self.final = nn.Conv2d(16,1,3,padding=1)
 
-        self.conv_layers = nn.Sequential(
-            #Start upsampling by transposing convolutional layers
-            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Dropout(dropout_p),
-            
-            nn.ConvTranspose2d(32, 16, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            nn.Dropout(dropout_p),
-            
-            nn.ConvTranspose2d(16, 8, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.BatchNorm2d(8),
-            nn.ReLU(),
-            nn.Dropout(dropout_p),
-            
-            nn.ConvTranspose2d(8, 4, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.BatchNorm2d(4),
-            nn.ReLU(),
-            nn.Dropout(dropout_p),
-            
-            nn.ConvTranspose2d(4, 1, kernel_size=3, stride=2, padding=1, output_padding=1),
-
-        )
-
-    def forward(self, x):
-        x = self.fc_layers(x)
-        x = x.view(x.size(0), 64, 5, 5)  #Reorganize the shape matching convolution layer
-        x = self.conv_layers(x)
-        return x
-
-
-
-
-class Encoder_CNN_2D_Layernorm(nn.Module):
-    def __init__(self,mask_size=160,dropout_p=0):
-        super(Encoder_CNN_2D_Layernorm, self).__init__()
-        self.conv_layers = nn.Sequential(
-            nn.Conv2d(1, 4, kernel_size=3, stride=1, padding=1),
-            nn.LayerNorm([4, mask_size, mask_size]),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(4, 8, kernel_size=3, stride=1, padding=1),
-            nn.LayerNorm([8, 80, 80]),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(8, 16, kernel_size=3, stride=1, padding=1),
-            nn.LayerNorm([16, 40, 40]),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.LayerNorm([32, 20, 20]),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.LayerNorm([64, 10, 10]),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-        )
-
-        self.fc_layers = nn.Sequential(
-			nn.Linear(64 * 5 * 5, 512),
-            # nn.Linear(512 * 9 * 9, 1024),
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            nn.Linear(512, 128),
-            nn.LayerNorm(128),
-            nn.ReLU(),
-            nn.Linear(128, 28)
-			# nn.Linear(1024, 28)
-        )
-        print("cnn_hyper_parameters:")
-        print("mask_size")
-        print(mask_size)
-        print("dropout_p")
-        print(dropout_p)
-
-    def forward(self, x):
-    
-        x = self.conv_layers(x)
-        x = x.view(x.size(0), -1)
-        x = self.fc_layers(x)
+    def forward(self, latent, enc_feats):
+        e1,e2,e3,e4 = enc_feats
+        x = self.fc(latent).view(latent.size(0),256,e4.size(2),e4.size(3))
+        x = F.interpolate(x, scale_factor=2)
+        x = self.up1(torch.cat([x,e3],dim=1))
+        x = F.interpolate(x, scale_factor=2)
+        x = self.up2(torch.cat([x,e2],dim=1))
+        x = F.interpolate(x, scale_factor=2)
+        x = self.up3(torch.cat([x,e1],dim=1))
+        x = F.interpolate(x, scale_factor=2)
+        x = self.up4(x)
+        x = self.final(x)
         return x
